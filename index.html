@@ -12,14 +12,18 @@
   ::-webkit-scrollbar-thumb { background: #2a3654; border-radius: 3px; }
   ::-webkit-scrollbar-thumb:hover { background: #3a4a6a; }
 </style>
-<!-- React + ReactDOM + react-is (required by Recharts) -->
-<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/react-is/umd/react-is.production.min.js"></script>
+<!-- React + ReactDOM -->
+<script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+<!-- Recharts dependencies -->
+<script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script src="https://unpkg.com/react-is@18.2.0/umd/react-is.production.min.js"></script>
 <!-- Recharts UMD (exposes window.Recharts) -->
-<script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
+<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.min.js"></script>
+<!-- Verify Recharts loaded -->
+<script>if(!window.Recharts){document.body.innerHTML='<h1 style="color:red;padding:40px">Recharts failed to load. Check network.</h1>';}</script>
 <!-- Babel for in-browser JSX -->
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.23.9/babel.min.js"></script>
 </head>
 <body>
 <div id="root"></div>
@@ -30,10 +34,6 @@ const {
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   ReferenceLine, ComposedChart, Scatter, Legend, ReferenceArea
 } = Recharts;
-
-  Line, Area, Bar,
-  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  ReferenceLine, ComposedChart, Scatter, AreaChart
 
 /* ══════════════════════════ PALETTE ══════════════════════════ */
 const C = {
