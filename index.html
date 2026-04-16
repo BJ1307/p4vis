@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Prosperity 4 Visualizer — 洞若观火</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #080c14; overflow-x: hidden; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #0f1520; }
+  ::-webkit-scrollbar-thumb { background: #2a3654; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3a4a6a; }
+</style>
+<!-- React + ReactDOM + react-is (required by Recharts) -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/react-is/umd/react-is.production.min.js"></script>
+<!-- Recharts UMD (exposes window.Recharts) -->
+<script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
+<!-- Babel for in-browser JSX -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo, useCallback, useRef, useEffect } = React;
+const {
+  LineChart, Line, AreaChart, Area, BarChart, Bar,
+  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  ReferenceLine, ComposedChart, Scatter, Legend, ReferenceArea
+} = Recharts;
+
+  Line, Area, Bar,
+  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  ReferenceLine, ComposedChart, Scatter, AreaChart
+
+/* ══════════════════════════ PALETTE ══════════════════════════ */
+const C = {
+  bg: "#080c14", panel: "#0f1520", panelAlt: "#131b2a",
+  border: "#1c2537", borderLight: "#2a3654",
+  text: "#e2e8f0", textDim: "#94a3b8", textMuted: "#5a6a80",
+  bid: "#22d3ee", bidDim: "rgba(34,211,238,0.12)",
+  ask: "#f97316", askDim: "rgba(249,115,22,0.12)",
+  mid: "#a78bfa",
+  profit: "#34d399", loss: "#f87171",
+  profitDim: "rgba(52,211,153,0.15)", lossDim: "rgba(248,113,113,0.15)",
+  pos: "#60a5fa", posDim: "rgba(96,165,250,0.15)",
+  accent: "#facc15", accentDim: "rgba(250,204,21,0.1)",
+  buy: "#34d399", sell: "#f87171",
+  scrubber: "#facc15", scrubberGlow: "rgba(250,204,21,0.3)",
+  grid: "rgba(148,163,184,0.06)",
+  tooltipBg: "rgba(10,16,26,0.96)",
+};
+const font = "'JetBrains Mono','Fira Code','SF Mono','Cascadia Code',monospace";
+
+/* ══════════════════════════ PARSING ══════════════════════════ */
+function parseActivitiesLog(csv) {
+  const lines = csv.trim().split("\n");
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const c = lines[i].split(";");
+    if (c.length < 17) continue;
+    rows.push({
+      day: +c[0], timestamp: +c[1], product: c[2],
+      bidPrices: [c[3], c[5], c[7]].filter(Boolean).map(Number),
+      bidVolumes: [c[4], c[6], c[8]].filter(Boolean).map(Number),
+      askPrices: [c[9], c[11], c[13]].filter(Boolean).map(Number),
+      askVolumes: [c[10], c[12], c[14]].filter(Boolean).map(Number),
+      midPrice: c[15] !== "" ? +c[15] : null,
+      profitLoss: c[16] !== "" ? +c[16] : 0,
+    });
+  }
+  return rows;
+}
+
+function parseGraphLog(csv) {
+  if (!csv) return [];
+  return csv.trim().split("\n").slice(1).map(l => {
+    const [ts, v] = l.split(";");
+    return { timestamp: +ts, pnl: +v };
+  });
+}
+
+function parseLambdaLogs(arr) {
+  if (!arr) return [];
+  return arr.map(e => {
+    try {
+      const p = JSON.parse(e.lambdaLog);
+      return {
+        timestamp: p[0][0], position: p[0][6] || {},
+        orders: (p[1] || []).map(o => ({ symbol: o[0], price: o[1], quantity: o[2] })),
+        algoLogs: p[4] || "",
+      };
+    } catch { return null; }
+  }).filter(Boolean);
+}
+
+function reconstructPositions(trades, timestamps, products) {
+  const sorted = [...trades].sort((a, b) => a.timestamp - b.timestamp);
+  const posMap = {};
+  const running = {};
+  products.forEach(p => { running[p] = 0; });
+  let ti = 0;
+  for (const ts of timestamps) {
+    while (ti < sorted.length && sorted[ti].timestamp <= ts) {
+      const t = sorted[ti];
+      if (!(t.symbol in running)) running[t.symbol] = 0;
+      if (t.buyer === "SUBMISSION") running[t.symbol] += t.quantity;
+      else if (t.seller === "SUBMISSION") running[t.symbol] -= t.quantity;
+      ti++;
+    }
+    posMap[ts] = { ...running };
+  }
+  return posMap;
+}
+
+function parseFile(text) {
+  const data = JSON.parse(text);
+  const activities = parseActivitiesLog(data.activitiesLog || "");
+  const products = [...new Set(activities.map(r => r.product))].sort();
+  const trades = data.tradeHistory || [];
+  const timestamps = [...new Set(activities.map(r => r.timestamp))].sort((a, b) => a - b);
+  const posFromTrades = trades.length > 0 ? reconstructPositions(trades, timestamps, products) : null;
+  return {
+    type: data.logs ? "log" : "json",
+    round: data.round || "?", status: data.status || "UNKNOWN", profit: data.profit ?? null,
+    activities, products, timestamps,
+    graphLog: parseGraphLog(data.graphLog),
+    finalPositions: data.positions || [], trades,
+    lambdaData: parseLambdaLogs(data.logs), posFromTrades,
+  };
+}
+
+/* ═══════════ HELPERS ═══════════ */
+const fmt = (n, d = 2) => n == null ? "—" : Number(n).toFixed(d);
+const fmtTs = (ts) => { const s = ts / 1000; return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`; };
+const pnlColor = (v) => v > 0 ? C.profit : v < 0 ? C.loss : C.textMuted;
+
+/* ═══════════ SMALL COMPONENTS ═══════════ */
+
+function CTip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  return (
+    <div style={{ background: C.tooltipBg, border: `1px solid ${C.border}`, padding: "6px 10px", borderRadius: 4, fontFamily: font, fontSize: 10, backdropFilter: "blur(8px)" }}>
+      <div style={{ color: C.textMuted, marginBottom: 3 }}>t={fmtTs(label)}</div>
+      {payload.filter(p => p.value != null).map((p, i) => (
+        <div key={i} style={{ color: p.color || C.text }}>{p.name}: <b>{fmt(p.value, Math.abs(p.value) > 100 ? 1 : 2)}</b></div>
+      ))}
+    </div>
+  );
+}
+
+function Sec({ title, children, compact }) {
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6, marginBottom: compact ? 8 : 12, overflow: "hidden" }}>
+      <div style={{ padding: "7px 12px", borderBottom: `1px solid ${C.border}` }}>
+        <span style={{ fontSize: 10, fontWeight: 600, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.05em" }}>{title}</span>
+      </div>
+      <div style={{ padding: compact ? "2px 4px" : "4px 8px" }}>{children}</div>
+    </div>
+  );
+}
+
+function St({ label, value, color, small }) {
+  return (
+    <div style={{ padding: small ? "5px 8px" : "8px 12px", background: C.panelAlt, borderRadius: 4, minWidth: small ? 72 : 100 }}>
+      <div style={{ fontSize: 8, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 1 }}>{label}</div>
+      <div style={{ fontSize: small ? 13 : 16, fontWeight: 700, color: color || C.text, fontFamily: font }}>{value}</div>
+    </div>
+  );
+}
+
+/* ═══════════ CHARTS ═══════════ */
+
+function PriceChart({ data, trades, product, scrubTs }) {
+  const chartData = useMemo(() => {
+    const rows = data.filter(r => r.product === product).map(r => ({
+      ts: r.timestamp, mid: r.midPrice, bid1: r.bidPrices[0] || null, ask1: r.askPrices[0] || null,
+    }));
+    const tsMap = {};
+    rows.forEach(r => { tsMap[r.ts] = r; });
+    trades.filter(t => t.symbol === product).forEach(t => {
+      const r = tsMap[t.timestamp];
+      if (r) {
+        if (t.buyer === "SUBMISSION") { r.buyPrice = t.price; }
+        else { r.sellPrice = t.price; }
+      }
+    });
+    return rows;
+  }, [data, trades, product]);
+
+  const domain = useMemo(() => {
+    const v = chartData.flatMap(d => [d.mid, d.bid1, d.ask1, d.buyPrice, d.sellPrice].filter(Boolean));
+    if (!v.length) return ["auto", "auto"];
+    const mn = Math.min(...v), mx = Math.max(...v), pad = (mx - mn) * 0.06 || 5;
+    return [Math.floor(mn - pad), Math.ceil(mx + pad)];
+  }, [chartData]);
+
+  return (
+    <ResponsiveContainer width="100%" height={260}>
+      <ComposedChart data={chartData} margin={{ top: 8, right: 8, bottom: 4, left: 4 }}>
+        <CartesianGrid stroke={C.grid} />
+        <XAxis dataKey="ts" tickFormatter={fmtTs} stroke={C.textMuted} tick={{ fontSize: 9, fontFamily: font }} interval="preserveStartEnd" minTickGap={50} />
+        <YAxis domain={domain} stroke={C.textMuted} tick={{ fontSize: 9, fontFamily: font }} tickFormatter={v => v.toLocaleString()} width={56} />
+        <Tooltip content={<CTip />} />
+        <Area type="stepAfter" dataKey="ask1" stroke={C.ask} fill={C.askDim} strokeWidth={1} name="Ask₁" dot={false} connectNulls />
+        <Area type="stepAfter" dataKey="bid1" stroke={C.bid} fill={C.bidDim} strokeWidth={1} name="Bid₁" dot={false} connectNulls />
+        <Line type="monotone" dataKey="mid" stroke={C.mid} strokeWidth={1.5} dot={false} name="Mid" connectNulls />
+        <Scatter dataKey="buyPrice" fill={C.buy} name="Buy Fill" shape="triangle" />
+        <Scatter dataKey="sellPrice" fill={C.sell} name="Sell Fill" shape="diamond" />
+        {scrubTs != null && <ReferenceLine x={scrubTs} stroke={C.scrubber} strokeWidth={1.5} strokeDasharray="4 2" />}
+      </ComposedChart>
+    </ResponsiveContainer>
+  );
+}
+
+function PosChart({ posMap, timestamps, product, scrubTs }) {
+  const chartData = useMemo(() => {
+    if (!posMap) return [];
+    return timestamps.map(ts => ({ ts, pos: posMap[ts]?.[product] || 0 }));
+  }, [posMap, timestamps, product]);
+  if (!chartData.length) return null;
+  return (
+    <ResponsiveContainer width="100%" height={150}>
+      <AreaChart data={chartData} margin={{ top: 8, right: 8, bottom: 4, left: 4 }}>
+        <CartesianGrid stroke={C.grid} />
+        <XAxis dataKey="ts" tickFormatter={fmtTs} stroke={C.textMuted} tick={{ fontSize: 9, fontFamily: font }} interval="preserveStartEnd" minTickGap={50} />
+        <YAxis stroke={C.textMuted} tick={{ fontSize: 9, fontFamily: font }} width={34} />
+        <Tooltip content={<CTip />} />
+        <ReferenceLine y={0} stroke={C.textMuted} strokeDasharray="3 3" />
+        <defs><linearGradient id={`pg_${product}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={C.pos} stopOpacity={0.25} /><stop offset="100%" stopColor={C.pos} stopOpacity={0} /></linearGradient></defs>
+        <Area type="stepAfter" dataKey="pos" stroke={C.pos} fill={`url(#pg_${product})`} strokeWidth={1.5} dot={false} name="Position" />
+        {scrubTs != null && <ReferenceLine x={scrubTs} stroke={C.scrubber} strokeWidth={1.5} strokeDasharray="4 2" />}
+      </AreaChart>
+    </ResponsiveContainer>
+  );
+}
+
+function PnLChart({ activities, product, scrubTs, graphLog }) {
+  const chartData = useMemo(() => {
+    if (graphLog?.length) return graphLog.map(g => ({ ts: g.timestamp, pnl: g.pnl }));
+    return activities.filter(r => r.product === product).map(r => ({ ts: r.timestamp, pnl: r.profitLoss }));
+  }, [activities, product, graphLog]);
+  const last = chartData.length ? chartData[chartData.length - 1].pnl : 0;
+  const col = last >= 0 ? C.profit : C.loss;
+  return (
+    <ResponsiveContainer width="100%" height={150}>
+      <AreaChart data={chartData} margin={{ top: 8, right: 8, bottom: 4, left: 4 }}>
+        <CartesianGrid stroke={C.grid} />
+        <XAxis dataKey="ts" tickFormatter={fmtTs} stroke={C.textMuted} tick={{ fontSize: 9, fontFamily: font }} interval="preserveStartEnd" minTickGap={50} />
+        <YAxis stroke={C.textMuted} tick={{ fontSize: 9, fontFamily: font }} width={46} tickFormatter={v => fmt(v, 0)} />
+        <Tooltip content={<CTip />} />
+        <ReferenceLine y={0} stroke={C.textMuted} strokeDasharray="3 3" />
+        <defs><linearGradient id="plG" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={col} stopOpacity={0.3} /><stop offset="100%" stopColor={col} stopOpacity={0} /></linearGradient></defs>
+        <Area type="monotone" dataKey="pnl" stroke={col} fill="url(#plG)" strokeWidth={1.5} dot={false} name="P&L" />
+        {scrubTs != null && <ReferenceLine x={scrubTs} stroke={C.scrubber} strokeWidth={1.5} strokeDasharray="4 2" />}
+      </AreaChart>
+    </ResponsiveContainer>
+  );
+}
+
+function SpreadChart({ data, product, scrubTs }) {
+  const chartData = useMemo(() => {
+    return data.filter(r => r.product === product).map(r => ({
+      ts: r.timestamp,
+      spread: r.askPrices[0] && r.bidPrices[0] ? r.askPrices[0] - r.bidPrices[0] : null,
+      bidVol: r.bidVolumes.reduce((a, b) => a + b, 0),
+      askVol: -r.askVolumes.reduce((a, b) => a + b, 0),
+    }));
+  }, [data, product]);
+  return (
+    <ResponsiveContainer width="100%" height={130}>
+      <ComposedChart data={chartData} margin={{ top: 8, right: 8, bottom: 4, left: 4 }}>
+        <CartesianGrid stroke={C.grid} />
+        <XAxis dataKey="ts" tickFormatter={fmtTs} stroke={C.textMuted} tick={{ fontSize: 9, fontFamily: font }} interval="preserveStartEnd" minTickGap={50} />
+        <YAxis yAxisId="s" stroke={C.textMuted} tick={{ fontSize: 9, fontFamily: font }} width={28} />
+        <YAxis yAxisId="v" orientation="right" stroke={C.textMuted} tick={{ fontSize: 9, fontFamily: font }} width={28} />
+        <Tooltip content={<CTip />} />
+        <Bar yAxisId="v" dataKey="bidVol" fill={C.bidDim} name="Bid Vol" />
+        <Bar yAxisId="v" dataKey="askVol" fill={C.askDim} name="Ask Vol" />
+        <Line yAxisId="s" type="stepAfter" dataKey="spread" stroke={C.accent} strokeWidth={1.5} dot={false} name="Spread" connectNulls />
+        {scrubTs != null && <ReferenceLine yAxisId="s" x={scrubTs} stroke={C.scrubber} strokeWidth={1.5} strokeDasharray="4 2" />}
+      </ComposedChart>
+    </ResponsiveContainer>
+  );
+}
+
+/* ═══════════ ORDER DEPTH PANEL ═══════════ */
+function DepthPanel({ activities, product, ts }) {
+  const row = activities.find(r => r.product === product && r.timestamp === ts);
+  if (!row) return <div style={{ color: C.textMuted, fontSize: 10, padding: 8 }}>—</div>;
+  const bids = row.bidPrices.map((p, i) => ({ price: p, vol: row.bidVolumes[i] })).filter(r => r.price);
+  const asks = row.askPrices.map((p, i) => ({ price: p, vol: row.askVolumes[i] })).filter(r => r.price);
+  const maxVol = Math.max(...[...bids, ...asks].map(r => r.vol || 0), 1);
+  const spread = asks[0] && bids[0] ? asks[0].price - bids[0].price : null;
+  return (
+    <div style={{ fontFamily: font, fontSize: 11 }}>
+      {[...asks].reverse().map((a, i) => (
+        <div key={`a${i}`} style={{ display: "flex", alignItems: "center", padding: "3px 8px", position: "relative" }}>
+          <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: `${(a.vol / maxVol) * 100}%`, background: C.askDim, borderRadius: 2 }} />
+          <span style={{ width: 64, color: C.ask, fontWeight: 600, position: "relative", zIndex: 1 }}>{fmt(a.price, 0)}</span>
+          <span style={{ width: 36, textAlign: "right", color: C.textDim, position: "relative", zIndex: 1 }}>{a.vol}</span>
+        </div>
+      ))}
+      <div style={{ padding: "3px 8px", borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", color: C.textMuted, fontSize: 9 }}>
+        <span>spread</span><span style={{ color: C.accent }}>{spread != null ? fmt(spread, 0) : "—"}</span>
+      </div>
+      {bids.map((b, i) => (
+        <div key={`b${i}`} style={{ display: "flex", alignItems: "center", padding: "3px 8px", position: "relative" }}>
+          <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: `${(b.vol / maxVol) * 100}%`, background: C.bidDim, borderRadius: 2 }} />
+          <span style={{ width: 64, color: C.bid, fontWeight: 600, position: "relative", zIndex: 1 }}>{fmt(b.price, 0)}</span>
+          <span style={{ width: 36, textAlign: "right", color: C.textDim, position: "relative", zIndex: 1 }}>{b.vol}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ═══════════ TICK DETAIL ═══════════ */
+function TickDetail({ data, product, ts }) {
+  const row = data.activities.find(r => r.product === product && r.timestamp === ts);
+  const tradesAt = data.trades.filter(t => t.symbol === product && t.timestamp === ts);
+  const pos = data.posFromTrades?.[ts]?.[product] ?? "—";
+  const lambda = data.lambdaData.find(d => d.timestamp === ts);
+  const orders = lambda?.orders.filter(o => o.symbol === product) || [];
+  const algoLog = lambda?.algoLogs || "";
+
+  return (
+    <div style={{ fontFamily: font, fontSize: 11 }}>
+      {/* Stats row */}
+      <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 8, padding: "0 4px" }}>
+        <St small label="Mid" value={fmt(row?.midPrice, 1)} color={C.mid} />
+        <St small label="Bid₁" value={row?.bidPrices[0] ? fmt(row.bidPrices[0], 0) : "—"} color={C.bid} />
+        <St small label="Ask₁" value={row?.askPrices[0] ? fmt(row.askPrices[0], 0) : "—"} color={C.ask} />
+        <St small label="Pos" value={pos} color={pos > 0 ? C.buy : pos < 0 ? C.sell : C.textMuted} />
+        <St small label="P&L" value={fmt(row?.profitLoss, 2)} color={pnlColor(row?.profitLoss)} />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: 8, padding: "0 4px" }}>
+        {/* Depth */}
+        <div style={{ minWidth: 120 }}>
+          <div style={{ fontSize: 9, color: C.textMuted, textTransform: "uppercase", marginBottom: 3, letterSpacing: "0.05em" }}>Order Book</div>
+          <div style={{ background: C.panelAlt, borderRadius: 4, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+            <DepthPanel activities={data.activities} product={product} ts={ts} />
+          </div>
+        </div>
+        {/* Right: fills, orders, log */}
+        <div style={{ minWidth: 0 }}>
+          {tradesAt.length > 0 && (
+            <div style={{ marginBottom: 6 }}>
+              <div style={{ fontSize: 9, color: C.textMuted, textTransform: "uppercase", marginBottom: 3 }}>Fills</div>
+              <div style={{ background: C.panelAlt, borderRadius: 4, border: `1px solid ${C.border}`, padding: "3px 0" }}>
+                {tradesAt.map((t, i) => {
+                  const isBuy = t.buyer === "SUBMISSION";
+                  return (
+                    <div key={i} style={{ padding: "2px 8px", display: "flex", gap: 6, color: isBuy ? C.buy : C.sell, fontSize: 11 }}>
+                      <span style={{ fontWeight: 700, width: 30 }}>{isBuy ? "BUY" : "SELL"}</span>
+                      <span>{t.quantity}x</span>
+                      <span>@ {fmt(t.price, 1)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+          {orders.length > 0 && (
+            <div style={{ marginBottom: 6 }}>
+              <div style={{ fontSize: 9, color: C.textMuted, textTransform: "uppercase", marginBottom: 3 }}>Orders Sent</div>
+              <div style={{ background: C.panelAlt, borderRadius: 4, border: `1px solid ${C.border}`, padding: "3px 0" }}>
+                {orders.map((o, i) => (
+                  <div key={i} style={{ padding: "2px 8px", display: "flex", gap: 6, color: o.quantity > 0 ? C.buy : C.sell, fontSize: 11 }}>
+                    <span style={{ fontWeight: 700, width: 30 }}>{o.quantity > 0 ? "BUY" : "SELL"}</span>
+                    <span>{Math.abs(o.quantity)}x</span>
+                    <span>@ {fmt(o.price, 1)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {algoLog && (
+            <div>
+              <div style={{ fontSize: 9, color: C.textMuted, textTransform: "uppercase", marginBottom: 3 }}>Log</div>
+              <div style={{ background: C.panelAlt, borderRadius: 4, border: `1px solid ${C.border}`, padding: "5px 8px", fontSize: 10, color: C.textDim, whiteSpace: "pre-wrap", maxHeight: 80, overflowY: "auto", lineHeight: 1.4 }}>
+                {algoLog}
+              </div>
+            </div>
+          )}
+          {!tradesAt.length && !orders.length && !algoLog && (
+            <div style={{ color: C.textMuted, fontSize: 10, padding: 8 }}>No activity</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════ TIMELINE SCRUBBER ═══════════ */
+function Scrubber({ timestamps, value, onChange, trades, product }) {
+  const ref = useRef(null);
+  const dragging = useRef(false);
+  const idx = timestamps.indexOf(value);
+
+  const tradeTicks = useMemo(() => {
+    const s = new Set();
+    trades.filter(t => t.symbol === product).forEach(t => s.add(t.timestamp));
+    return s;
+  }, [trades, product]);
+
+  const calc = useCallback((e) => {
+    const rect = ref.current.getBoundingClientRect();
+    const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const i = Math.round(x * (timestamps.length - 1));
+    onChange(timestamps[i]);
+  }, [timestamps, onChange]);
+
+  const onKey = (e) => {
+    if (e.key === "ArrowRight" && idx < timestamps.length - 1) { e.preventDefault(); onChange(timestamps[idx + 1]); }
+    if (e.key === "ArrowLeft" && idx > 0) { e.preventDefault(); onChange(timestamps[idx - 1]); }
+    if (e.key === "Home") { e.preventDefault(); onChange(timestamps[0]); }
+    if (e.key === "End") { e.preventDefault(); onChange(timestamps[timestamps.length - 1]); }
+  };
+
+  const pct = timestamps.length > 1 ? (idx / (timestamps.length - 1)) * 100 : 0;
+
+  return (
+    <div style={{ padding: "0 4px", userSelect: "none" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 5 }}>
+        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+          <button onClick={() => idx > 0 && onChange(timestamps[idx - 1])} style={btnSt}>◀</button>
+          <button onClick={() => idx < timestamps.length - 1 && onChange(timestamps[idx + 1])} style={btnSt}>▶</button>
+          <span style={{ fontSize: 11, color: C.text, marginLeft: 6, fontWeight: 600 }}>{fmtTs(value)}</span>
+          <span style={{ fontSize: 9, color: C.textMuted, marginLeft: 4 }}>tick {idx + 1}/{timestamps.length}</span>
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          <button onClick={() => onChange(timestamps[0])} style={btnSt}>⏮</button>
+          <button onClick={() => onChange(timestamps[timestamps.length - 1])} style={btnSt}>⏭</button>
+        </div>
+      </div>
+      <div
+        ref={ref} tabIndex={0}
+        onPointerDown={e => { dragging.current = true; calc(e); e.target.setPointerCapture(e.pointerId); }}
+        onPointerMove={e => { if (dragging.current) calc(e); }}
+        onPointerUp={() => { dragging.current = false; }}
+        onKeyDown={onKey}
+        style={{ position: "relative", height: 30, cursor: "pointer", outline: "none", touchAction: "none" }}
+      >
+        <div style={{ position: "absolute", top: 12, left: 0, right: 0, height: 6, background: C.panelAlt, borderRadius: 3, border: `1px solid ${C.border}` }} />
+        <div style={{ position: "absolute", top: 12, left: 0, width: `${pct}%`, height: 6, background: `linear-gradient(90deg, ${C.scrubber}33, ${C.scrubber}88)`, borderRadius: 3 }} />
+        {/* Trade tick marks */}
+        {timestamps.map((ts, i) => tradeTicks.has(ts) ? (
+          <div key={i} style={{ position: "absolute", left: `${(i / (timestamps.length - 1)) * 100}%`, top: 7, width: 2, height: 4, background: C.buy, borderRadius: 1, transform: "translateX(-1px)" }} />
+        ) : null)}
+        {/* Thumb */}
+        <div style={{
+          position: "absolute", left: `${pct}%`, top: 6, width: 18, height: 18,
+          background: C.scrubber, borderRadius: "50%", transform: "translateX(-9px)",
+          boxShadow: `0 0 8px ${C.scrubberGlow}`, border: `2px solid ${C.bg}`,
+          transition: dragging.current ? "none" : "left 0.06s",
+        }} />
+      </div>
+    </div>
+  );
+}
+
+const btnSt = { background: C.panelAlt, border: `1px solid ${C.border}`, color: C.textDim, borderRadius: 3, padding: "2px 8px", cursor: "pointer", fontFamily: font, fontSize: 11, lineHeight: 1 };
+
+/* ═══════════ TRADES TABLE ═══════════ */
+function Trades({ trades, product }) {
+  const f = trades.filter(t => t.symbol === product);
+  if (!f.length) return <div style={{ color: C.textMuted, padding: 10, fontSize: 10 }}>No trades</div>;
+  return (
+    <div style={{ maxHeight: 200, overflowY: "auto" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10, fontFamily: font }}>
+        <thead>
+          <tr style={{ color: C.textMuted, borderBottom: `1px solid ${C.border}`, position: "sticky", top: 0, background: C.panel }}>
+            {["Time", "Side", "Qty", "Price", "Notional"].map(h => <th key={h} style={{ padding: "4px 6px", textAlign: "left", fontWeight: 500 }}>{h}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {f.map((t, i) => {
+            const b = t.buyer === "SUBMISSION";
+            return (
+              <tr key={i} style={{ borderBottom: `1px solid ${C.border}`, color: b ? C.buy : C.sell }}>
+                <td style={{ padding: "3px 6px" }}>{fmtTs(t.timestamp)}</td>
+                <td style={{ padding: "3px 6px", fontWeight: 700 }}>{b ? "BUY" : "SELL"}</td>
+                <td style={{ padding: "3px 6px" }}>{t.quantity}</td>
+                <td style={{ padding: "3px 6px" }}>{fmt(t.price, 1)}</td>
+                <td style={{ padding: "3px 6px", color: C.textDim }}>{fmt(t.price * t.quantity, 0)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ═══════════ UPLOAD ═══════════ */
+function Upload({ onLoad }) {
+  const [drag, setDrag] = useState(false);
+  const [err, setErr] = useState(null);
+  const r = useRef();
+  const go = (f) => { setErr(null); const rd = new FileReader(); rd.onload = e => { try { onLoad(parseFile(e.target.result)); } catch (x) { setErr(x.message); } }; rd.readAsText(f); };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "100vh", background: C.bg, fontFamily: font, color: C.text }}>
+      <div style={{ fontSize: 22, fontWeight: 800, marginBottom: 4, letterSpacing: "-0.03em" }}>
+        <span style={{ color: C.accent }}>⬡</span> PROSPERITY 4 <span style={{ color: C.mid }}>VISUALIZER</span>
+      </div>
+      <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 24 }}>by 洞若观火 · Drop .log or .json</div>
+      <div onDragOver={e => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)}
+        onDrop={e => { e.preventDefault(); setDrag(false); if (e.dataTransfer.files[0]) go(e.dataTransfer.files[0]); }}
+        onClick={() => r.current?.click()}
+        style={{ width: 360, maxWidth: "90vw", height: 140, border: `2px dashed ${drag ? C.accent : C.borderLight}`, borderRadius: 10, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", background: drag ? C.accentDim : "transparent", transition: "all 0.2s" }}>
+        <div style={{ fontSize: 26, marginBottom: 6, opacity: 0.6 }}>📂</div>
+        <div style={{ fontSize: 11, color: C.textDim }}>Click or drag file</div>
+        <input ref={r} type="file" accept=".log,.json" style={{ display: "none" }} onChange={e => { if (e.target.files[0]) go(e.target.files[0]); }} />
+      </div>
+      {err && <div style={{ marginTop: 12, padding: "6px 14px", background: C.lossDim, border: `1px solid ${C.loss}`, borderRadius: 5, color: C.loss, fontSize: 10, maxWidth: 360 }}>{err}</div>}
+    </div>
+  );
+}
+
+/* ══════════════════════════ MAIN ══════════════════════════ */
+function App() {
+  const [data, setData] = useState(null);
+  const [product, setProduct] = useState(null);
+  const [scrubTs, setScrubTs] = useState(null);
+
+  const onLoad = useCallback((p) => { setData(p); setProduct(p.products[0]); setScrubTs(p.timestamps[0]); }, []);
+  if (!data) return <Upload onLoad={onLoad} />;
+
+  const hasTr = data.trades.length > 0;
+  const hasPos = !!data.posFromTrades;
+  const hasGL = data.graphLog.length > 0;
+
+  return (
+    <div style={{ background: C.bg, minHeight: "100vh", fontFamily: font, color: C.text }}>
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 14px", borderBottom: `1px solid ${C.border}`, background: C.panel }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 13, fontWeight: 800 }}><span style={{ color: C.accent }}>⬡</span> P4 VIS <span style={{ color: C.textMuted, fontSize: 9, fontWeight: 400 }}>洞若观火</span></span>
+          <span style={{ padding: "1px 6px", borderRadius: 3, fontSize: 9, fontWeight: 700, background: data.status === "FINISHED" ? C.profitDim : C.lossDim, color: data.status === "FINISHED" ? C.profit : C.loss }}>{data.status}</span>
+          <span style={{ color: C.textMuted, fontSize: 10 }}>R{data.round}</span>
+          <span style={{ color: C.textMuted, fontSize: 8, padding: "1px 4px", border: `1px solid ${C.border}`, borderRadius: 3 }}>{data.type === "log" ? "FULL" : "RESULTS"}</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 15, fontWeight: 800, color: pnlColor(data.profit) }}>{data.profit != null ? fmt(data.profit, 2) : "—"}</span>
+          <span style={{ fontSize: 8, color: C.textMuted }}>P&L</span>
+          <button onClick={() => { setData(null); setProduct(null); setScrubTs(null); }} style={btnSt}>↻</button>
+        </div>
+      </div>
+
+      {/* Product Tabs */}
+      <div style={{ display: "flex", background: C.panel, borderBottom: `1px solid ${C.border}`, padding: "0 14px" }}>
+        {data.products.map(p => {
+          const act = p === product;
+          const a = data.activities.filter(r => r.product === p);
+          const lp = a.length ? a[a.length - 1].profitLoss : 0;
+          return (
+            <button key={p} onClick={() => setProduct(p)} style={{
+              background: "transparent", border: "none", borderBottom: act ? `2px solid ${C.accent}` : "2px solid transparent",
+              color: act ? C.text : C.textMuted, padding: "8px 12px", cursor: "pointer", fontSize: 10, fontFamily: font, fontWeight: act ? 700 : 400, display: "flex", alignItems: "center", gap: 5,
+            }}>
+              {p.replace(/_/g, " ")}
+              <span style={{ fontSize: 9, color: pnlColor(lp) }}>{fmt(lp, 1)}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div style={{ padding: "10px 14px", maxWidth: 1440, margin: "0 auto" }}>
+        {/* Scrubber */}
+        <Sec title="Timeline" compact>
+          <div style={{ padding: "4px 4px 8px" }}>
+            <Scrubber timestamps={data.timestamps} value={scrubTs} onChange={setScrubTs} trades={data.trades} product={product} />
+          </div>
+        </Sec>
+
+        {/* Tick Detail */}
+        <Sec title={`Tick ${fmtTs(scrubTs)}`} compact>
+          <div style={{ padding: "6px 4px" }}>
+            <TickDetail data={data} product={product} ts={scrubTs} />
+          </div>
+        </Sec>
+
+        {/* Charts */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+          <Sec title="Price" compact><PriceChart data={data.activities} trades={data.trades} product={product} scrubTs={scrubTs} /></Sec>
+          <Sec title={hasGL ? "Aggregate P&L" : "Product P&L"} compact><PnLChart activities={data.activities} product={product} scrubTs={scrubTs} graphLog={hasGL ? data.graphLog : null} /></Sec>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: hasPos ? "1fr 1fr" : "1fr", gap: 8 }}>
+          <Sec title="Spread & Volume" compact><SpreadChart data={data.activities} product={product} scrubTs={scrubTs} /></Sec>
+          {hasPos && <Sec title="Position (reconstructed)" compact><PosChart posMap={data.posFromTrades} timestamps={data.timestamps} product={product} scrubTs={scrubTs} /></Sec>}
+        </div>
+
+        {/* Trades */}
+        {hasTr && <Sec title={`Trades — ${data.trades.filter(t => t.symbol === product).length} fills`} compact><Trades trades={data.trades} product={product} /></Sec>}
+      </div>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
